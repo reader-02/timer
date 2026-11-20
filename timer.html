@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#000000">
+<title>Timer</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    height: 100%;
+    background: #000;
+    color: #fff;
+    overflow: hidden;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+  }
+  body {
+    position: fixed; inset: 0;
+    height: 100vh; height: 100dvh;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    gap: 5vmin;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right)
+             env(safe-area-inset-bottom) env(safe-area-inset-left);
+    transition: background .3s;
+  }
+
+  /* ---------- the numbers ---------- */
+  .time {
+    display: flex; align-items: center;
+    font-size: min(19vw, 44vh);     /* size of the numbers */
+    font-weight: 300;               /* thickness: 100 = thinnest, 900 = boldest */
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+    color: #fff;
+  }
+  .time input {
+    display: block;
+    width: 2ch; height: 1.05em;
+    font: inherit; color: inherit; line-height: 1;
+    background: transparent; border: none; outline: none;
+    text-align: center; padding: 0;
+    border-radius: 0;
+    caret-color: transparent;
+    transition: opacity .2s, color .2s;
+  }
+  #s { pointer-events: none; }   /* seconds are display-only */
+  .colon { margin: -.08em .04em 0; }
+
+  body.idle #h, body.idle #m,
+  body.paused #h, body.paused #m { cursor: pointer; }
+  #h:focus, #m:focus { color: #888; }          /* number being edited turns grey */
+  body.paused .time input { opacity: .5; }
+
+  /* ---------- button ---------- */
+  #btn {
+    width: clamp(72px, 15vmin, 170px);
+    aspect-ratio: 1;
+    border: none; border-radius: 50%;
+    background: #fff; color: #000;
+    display: grid; place-items: center;
+    cursor: pointer;
+    transition: transform .1s, background .2s;
+  }
+  #btn:active { transform: scale(.94); }
+  #btn:focus-visible { outline: 3px solid #fff; outline-offset: 4px; }
+  #btn svg { width: 46%; height: 46%; fill: currentColor; }
+
+  #hint {
+    min-height: 1.4em;
+    font-size: clamp(12px, 2.2vmin, 20px);
+    opacity: .5; text-align: center;
+  }
+
+  body.done { animation: flash 1s steps(1) infinite; }
+  @keyframes flash { 50% { background: #b00020; } }
+</style>
+</head>
+<body class="idle">
+  <div class="time">
+    <input id="h" type="text" inputmode="numeric" pattern="[0-9]*" autocomplete="off" aria-label="Hours">
+    <span class="colon">:</span>
+    <input id="m" type="text" inputmode="numeric" pattern="[0-9]*" autocomplete="off" aria-label="Minutes">
+    <span class="colon">:</span>
+    <input id="s" type="text" value="00" readonly tabindex="-1" aria-label="Seconds">
+  </div>
+
+  <button id="btn" aria-label="Start">
+    <svg viewBox="0 0 24 24"><path id="icon" d="M8 5v14l11-7z"/></svg>
+  </button>
+
+  <p id="hint"></p>
+
+<script>
+  const $ = id => document.getElementById(id);
+  const hEl = $('h'), mEl = $('m'), sEl = $('s'), btn = $('btn'), icon = $('icon'), hint = $('hint');
+
+  const PLAY = 'M8 5v14l11-7z';
+  const PAUSE = 'M6 5h4v14H6zM14 5h4v14h-4z';
+  const STOP = 'M6 6h12v12H6z';
+
+  let running = false, alarmOn = false;
+  let remaining = 0;          // ms left (0 = not started / fresh)
+  let endAt = 0, lastSet = 0;
+  let tick = null, alarmTimer = null, audio = null, wakeLock = null;
+
+  const pad = n => String(n).padStart(2, '0');
+
+  function readInputs() {
+    const h = Math.min(99, parseInt(hEl.value, 10) || 0);
+    const m = Math.min(59, parseInt(mEl.value, 10) || 0);
+    return (h * 3600 + m * 60) * 1000;
+  }
+
+  function render(ms) {
+    const t = Math.max(0, Math.ceil(ms / 1000));
+    const h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60), s = t % 60;
+    hEl.value = pad(h); mEl.value = pad(m); sEl.value = pad(s);
+    document.title = running ? `${pad(h)}:${pad(m)}:${pad(s)} · Timer` : 'Timer';
+  }
+
+  function setUI() {
+    const state = alarmOn ? 'done' : running ? 'running' : (remaining > 0 ? 'paused' : 'idle');
+    document.body.className = state;
+    icon.setAttribute('d', alarmOn ? STOP : running ? PAUSE : PLAY);
+    btn.setAttribute('aria-label', alarmOn ? 'Stop alarm' : running ? 'Pause' : 'Start');
+    hEl.readOnly = mEl.readOnly = running || alarmOn;
+    hint.textContent = {
+      idle: '',
+      running: '',
+      paused: 'Paused',
+      done: "Time's up · press to reset"
+    }[state];
+  }
+
+  /* ---------- timer ---------- */
+  function start() {
+    if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+    if (remaining <= 0) { remaining = readInputs(); lastSet = remaining; }
+    if (remaining <= 0) { setUI(); hEl.focus(); return; }
+    endAt = Date.now() + remaining;
+    running = true;
+    clearInterval(tick);
+    tick = setInterval(update, 100);
+    update();
+    setUI();
+    keepAwake(true);
+  }
+
+  function pause() {
+    remaining = Math.max(0, endAt - Date.now());
+    running = false;
+    clearInterval(tick);
+    render(remaining);
+    setUI();
+    keepAwake(false);
+  }
+
+  function update() {
+    if (!running) return;
+    remaining = endAt - Date.now();
+    if (remaining <= 0) finish();
+    else render(remaining);
+  }
+
+  function finish() {
+    clearInterval(tick);
+    running = false;
+    remaining = 0;
+    render(0);
+    alarmOn = true;
+    setUI();
+    let beeps = 0;
+    beep();
+    alarmTimer = setInterval(() => {
+      if (++beeps >= 60) { clearInterval(alarmTimer); return; } // stop sound after ~1 min
+      beep();
+    }, 1000);
+  }
+
+  function stopAlarm() {
+    alarmOn = false;
+    clearInterval(alarmTimer);
+    remaining = 0;
+    render(lastSet);
+    setUI();
+    keepAwake(false);
+  }
+
+  function toggle() {
+    goFullscreen();
+    unlockAudio();
+    if (alarmOn) stopAlarm();
+    else if (running) pause();
+    else start();
+  }
+
+  /* ---------- sound ---------- */
+  function unlockAudio() {
+    if (!audio) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) audio = new AC();
+    }
+    if (audio && audio.state === 'suspended') audio.resume();
+  }
+
+  function beep() {
+    if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
+    if (!audio) return;
+    const t0 = audio.currentTime;
+    for (let i = 0; i < 3; i++) {
+      const t = t0 + i * 0.2;
+      const o = audio.createOscillator(), g = audio.createGain();
+      o.type = 'sine'; o.frequency.value = 880;
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(0.5, t + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.15);
+      o.connect(g).connect(audio.destination);
+      o.start(t); o.stop(t + 0.16);
+    }
+  }
+
+  /* ---------- full screen & keep screen on ---------- */
+  function goFullscreen() {
+    const d = document, el = d.documentElement;
+    if (d.fullscreenElement || d.webkitFullscreenElement) return;
+    const req = el.requestFullscreen || el.webkitRequestFullscreen;
+    if (!req) return;
+    try {
+      const p = req.call(el, { navigationUI: 'hide' });
+      if (p && p.catch) p.catch(() => {});
+    } catch (e) {}
+  }
+
+  async function keepAwake(on) {
+    try {
+      if (on && 'wakeLock' in navigator && !wakeLock) {
+        wakeLock = await navigator.wakeLock.request('screen');
+        wakeLock.addEventListener('release', () => { wakeLock = null; });
+      } else if (!on && wakeLock && !running && !alarmOn) {
+        await wakeLock.release();
+        wakeLock = null;
+      }
+    } catch (e) {}
+  }
+
+  /* ---------- events ---------- */
+  btn.addEventListener('click', toggle);
+  document.addEventListener('click', goFullscreen);   // first tap anywhere → full screen
+
+  document.addEventListener('keydown', e => {
+    if (e.target.tagName === 'INPUT' || e.target === btn) return;
+    if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); toggle(); }
+  });
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && (running || alarmOn)) {
+      update();
+      keepAwake(true);
+    }
+  });
+
+  [hEl, mEl].forEach(el => {
+    el.addEventListener('focus', () => {
+      if (running || alarmOn) { el.blur(); return; }
+      setTimeout(() => el.select(), 0);
+    });
+    el.addEventListener('input', () => {
+      el.value = el.value.replace(/\D/g, '').slice(-2);
+      remaining = 0;               // editing resets to a fresh countdown
+      sEl.value = '00';
+      setUI();
+    });
+    el.addEventListener('blur', () => {
+      if (!running && remaining === 0) render(readInputs());
+    });
+    el.addEventListener('keydown', e => {
+      if (e.key === 'Enter') { el.blur(); }
+    });
+  });
+
+  /* ---------- init ---------- */
+  render(6 * 60 * 60 * 1000);   // default: 6 hours
+  setUI();
+</script>
+</body>
+</html>
